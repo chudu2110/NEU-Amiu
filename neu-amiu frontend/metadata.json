@@ -1,0 +1,8 @@
+{
+  "name": "NEU Amiu",
+  "description": "A Tinder-like dating web application exclusively for students of National Economics University (NEU) in Vietnam. Features profile swiping, light/dark modes, and multi-language support (English/Vietnamese). Login is restricted to @st.neu.edu.vn email addresses.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ]
+}
