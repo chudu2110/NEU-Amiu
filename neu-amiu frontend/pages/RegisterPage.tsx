@@ -1,26 +1,38 @@
 import React, { useState } from 'react';
 import { REQUIRED_EMAIL_DOMAIN } from '../constants';
 import { useStore } from '../hooks/useStore';
-import LanguageSwitcher from './LanguageSwitcher';
+import LanguageSwitcher from '../components/LanguageSwitcher';
 
 interface RegisterPageProps {
   onSwitchToLogin: () => void;
+  onOtpSent: (email: string) => void;
 }
 
-const RegisterPage: React.FC<RegisterPageProps> = ({ onSwitchToLogin }) => {
+const RegisterPage: React.FC<RegisterPageProps> = ({ onSwitchToLogin, onOtpSent }) => {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [error, setError] = useState('');
-  const { register, t } = useStore();
+  const { t } = useStore();
 
-  const handleRegister = (e: React.FormEvent) => {
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     if (!email.toLowerCase().endsWith(REQUIRED_EMAIL_DOMAIN)) {
       setError(t('invalidEmail'));
       return;
     }
-    register(email, name);
+    try {
+      const res = await fetch('/api/auth/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.message || data?.error || 'Send OTP failed');
+      onOtpSent(email);
+    } catch (err: any) {
+      setError(err?.message || 'Có lỗi xảy ra');
+    }
   };
 
   return (

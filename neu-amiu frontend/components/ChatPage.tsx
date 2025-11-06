@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef, FC } from 'react';
 import { useStore, Message, Location, MessageType } from '../hooks/useStore';
 import type { User } from '../types';
-import { BackIcon, ImageIcon, MicrophoneIcon, MapPinIcon, SendIcon, PaperclipIcon, PlayIcon, PauseIcon, StopIcon, TrashIcon } from '../assets/icons';
+import { BackIcon, ImageIcon, MapPinIcon, SendIcon, PaperclipIcon, PlayIcon, PauseIcon, StopIcon, TrashIcon } from '../assets/icons';
+import socket from '../data/socket';
 
 // --- Helper Functions ---
-const fileToBase64 = (file: File): Promise<string> => {
+const fileToBase64 = (file: Blob | File): Promise<string> => {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.readAsDataURL(file);
+        reader.readAsDataURL(file as Blob);
         reader.onload = () => resolve(reader.result as string);
         reader.onerror = error => reject(error);
     });
@@ -33,7 +34,7 @@ const AudioPlayer: FC<{ src: string }> = ({ src }) => {
     useEffect(() => {
         const audio = audioRef.current;
         const updateProgress = () => {
-            if (audio) {
+            if (audio && audio.duration) {
                 setProgress((audio.currentTime / audio.duration) * 100);
             }
         };
@@ -63,10 +64,10 @@ const AudioPlayer: FC<{ src: string }> = ({ src }) => {
 const GifPicker: FC<{ onSelect: (url: string) => void, onClose: () => void }> = ({ onSelect, onClose }) => {
     const { t } = useStore();
     const gifs = [
-        'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3dweXR3aXJ1Z2s3ZmNlY2JjYmo5aGllZ21qd3N4YXR2aG45enRnayZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3o7abBUNCb6HEsR00U/giphy.gif',
-        'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExbDBoOTRpeXk2cHVmN2N0ZnJ0cG83a3p6aXl1MDRyZWN5OW51dXNqMSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3oz8xAFtqoOUUrsh7W/giphy.gif',
-        'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2F0aHBocjRoZTN4dWRxZDA2YWQ2cHNqZXlscXJtN2VzbXQ1Z2FkayZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3oEjI4sFlp73fvEYgw/giphy.gif',
-        'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExb214M3Njb3A2NHN0ZHM2dTNvbDhycG04c3B0dHd6cGg0aGtudnpoYSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/d2Z9QYzA2H5wo/giphy.gif',
+        'https://media.giphy.com/media/3o7abBUNCb6HEsR00U/giphy.gif',
+        'https://media.giphy.com/media/3oz8xAFtqoOUUrsh7W/giphy.gif',
+        'https://media.giphy.com/media/3oEjI4sFlp73fvEYgw/giphy.gif',
+        'https://media.giphy.com/media/d2Z9QYzA2H5wo/giphy.gif',
     ];
 
     return (
@@ -106,15 +107,13 @@ interface ChatPageProps {
 }
 
 const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
-    const { t, chats, addMessage, deleteMessage } = useStore();
+    const store = useStore();
+    const { t, chats, addMessage, deleteMessage } = store;
     const [inputValue, setInputValue] = useState('');
     const [isAttachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
-    const [recordingStatus, setRecordingStatus] = useState<'idle' | 'recording'>('idle');
-    const [recordedAudio, setRecordedAudio] = useState<{ url: string; blob: Blob } | null>(null);
     const [isGifPickerOpen, setGifPickerOpen] = useState(false);
     const [messageToDelete, setMessageToDelete] = useState<Message | null>(null);
 
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const longPressTimerRef = useRef<number>();
@@ -122,21 +121,136 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
     const chat = chats.find(c => c.matchId === user.id);
     const messages = chat ? chat.messages : [];
 
+    // For testing stage: use global-room (backend auto-joins it).
+    // Later: replace with conversation id logic.
+    const roomId = 'global-room';
+
+    // Generate user ID từ email để đảm bảo consistency
+    const generateUserIdFromEmail = (email: string | null): string => {
+      if (!email) return 'me_local';
+      let hash = 0;
+      for (let i = 0; i < email.length; i++) {
+        const char = email.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash;
+      }
+      return String(Math.abs(hash) % 1000000);
+    };
+    
+    // try to get real logged-in user id from store, otherwise fallback
+    const userEmail = (store as any).userEmail;
+    const myId = generateUserIdFromEmail(userEmail) || 'me_local';
+
     const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     useEffect(scrollToBottom, [messages]);
-    
-    const createAndAddMessage = (type: MessageType, content: string | Location) => {
+
+    // --- Socket integration ---
+    useEffect(() => {
+        // Tell server to join (server currently auto-joins global-room too, but it's fine)
+        try {
+            socket.emit('join', { roomId, userId: myId });
+        } catch (err) {
+            console.warn('Socket join failed', err);
+        }
+
+        // Handler for incoming messages (chỉ để hiển thị realtime khi đang mở ChatPage)
+        // Lưu ý: App.tsx đã có listener toàn cục để nhận tin nhắn ở mọi trang
+        // Handler này chỉ để đảm bảo tin nhắn hiển thị ngay khi đang trong ChatPage
+        const handleIncoming = (payload: any) => {
+            // Normalize IDs về string để so sánh chính xác
+            const payloadFromStr = String(payload.from || '');
+            const payloadToStr = String(payload.to || '');
+            const myIdStr = String(myId || '');
+            const userIdStr = String(user.id || '');
+            
+            // Bỏ qua tin nhắn từ chính mình (đã được thêm local rồi)
+            if (payloadFromStr === myIdStr) {
+                return;
+            }
+
+            // Chỉ xử lý tin nhắn từ user đang chat với (trong ChatPage này)
+            // Tin nhắn gửi cho mình đã được xử lý bởi App.tsx global listener rồi
+            const isFromCurrentChatUser = payloadFromStr === userIdStr;
+            const isForMe = payloadToStr === myIdStr;
+            
+            // Chỉ xử lý nếu tin nhắn từ user đang chat với
+            // App.tsx đã xử lý tin nhắn gửi cho mình rồi, nên không cần xử lý lại ở đây
+            if (!isFromCurrentChatUser) {
+                return; // Bỏ qua, để App.tsx xử lý
+            }
+
+            // Normalize payload into Message type expected by store
+            const incoming: Message = {
+                id: payload.id ?? Date.now() + Math.random(),
+                sender: 'them',
+                timestamp: payload.ts ?? Date.now(),
+                type: (payload.type as MessageType) ?? 'text',
+                content: payload.content ?? payload.text ?? '',
+            };
+
+            // Check duplicate - tin nhắn có thể đã được thêm bởi App.tsx global listener
+            const currentChat = chats.find(c => c.matchId === user.id);
+            const currentMessages = currentChat ? currentChat.messages : [];
+            
+            // Check duplicate dựa trên ID
+            const existsById = currentMessages.some(m => m.id === incoming.id);
+            if (existsById) {
+                return; // Đã có, bỏ qua
+            }
+            
+            // Check duplicate dựa trên content và timestamp
+            const existsByContent = currentMessages.some(m => 
+                m.content === incoming.content && 
+                Math.abs(m.timestamp - incoming.timestamp) < 1000 &&
+                m.sender === incoming.sender
+            );
+            
+            if (existsByContent) {
+                return; // Đã có, bỏ qua
+            }
+
+            // Thêm tin nhắn (trường hợp này hiếm vì App.tsx đã xử lý rồi)
+            // Nhưng giữ lại để đảm bảo không miss tin nhắn
+            addMessage(user.id, incoming);
+        };
+
+        socket.on('message', handleIncoming);
+
+        socket.on('user:joined', (d: any) => {
+            // optional: show toast or update presence
+            // console.log('user joined', d);
+        });
+
+        return () => {
+            socket.off('message', handleIncoming);
+            socket.off('user:joined');
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [roomId, user.id, myId, chats]);
+
+    const createAndAddMessage = async (type: MessageType, content: string | Location) => {
         const newMessage: Message = { id: Date.now(), type, content, sender: 'me', timestamp: Date.now() };
+        // optimistic local add
         addMessage(user.id, newMessage);
 
-        // Bot simulation for text messages only
-        if (type === 'text') {
-            setTimeout(() => {
-                const botReplies = [t('botMessage1'), t('botMessage2'), t('botMessage3')];
-                const botReplyText = botReplies[(messages.filter(m => m.type === 'text').length / 2) % botReplies.length] || "Hmm...";
-                const botMessage: Message = { id: Date.now() + 1, sender: 'them', timestamp: Date.now(), type: 'text', content: botReplyText };
-                addMessage(user.id, botMessage);
-            }, 1500);
+        // build payload to server
+        const payload: any = {
+            roomId,
+            from: myId,
+            to: user.id,
+            ts: newMessage.timestamp,
+            id: newMessage.id,
+            type,
+            // server expects `text` in current backend implementation: put serialized content there
+            text: typeof content === 'string' ? content : JSON.stringify(content),
+            // keep content as well for future-backend compatibility
+            content: typeof content === 'string' ? content : content,
+        };
+
+        try {
+            socket.emit('message', payload);
+        } catch (err) {
+            console.warn('Socket emit error', err);
         }
     };
 
@@ -150,7 +264,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
         const file = e.target.files?.[0];
         if (file) {
             const base64 = await fileToBase64(file);
-            createAndAddMessage('image', base64);
+            await createAndAddMessage('image', base64);
         }
         setAttachmentMenuOpen(false);
     };
@@ -169,35 +283,6 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
         setAttachmentMenuOpen(false);
     };
 
-    const startRecording = async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorderRef.current = new MediaRecorder(stream);
-        const audioChunks: Blob[] = [];
-        mediaRecorderRef.current.ondataavailable = event => audioChunks.push(event.data);
-        mediaRecorderRef.current.onstop = () => {
-            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-            const audioUrl = URL.createObjectURL(audioBlob);
-            setRecordedAudio({ url: audioUrl, blob: audioBlob });
-            stream.getTracks().forEach(track => track.stop());
-        };
-        mediaRecorderRef.current.start();
-        setRecordingStatus('recording');
-        setAttachmentMenuOpen(false);
-    };
-
-    const stopRecording = () => {
-        mediaRecorderRef.current?.stop();
-        setRecordingStatus('idle');
-    };
-
-    const sendRecording = async () => {
-        if (recordedAudio) {
-            const base64 = await fileToBase64(recordedAudio.blob as File);
-            createAndAddMessage('audio', base64);
-            setRecordedAudio(null);
-        }
-    };
-    
     const handleGifSelect = (url: string) => {
         createAndAddMessage('gif', url);
         setGifPickerOpen(false);
@@ -213,11 +298,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
     const handlePressEnd = () => {
         clearTimeout(longPressTimerRef.current);
     };
-    
+
     const handleConfirmDelete = () => {
         if (messageToDelete) {
             deleteMessage(user.id, messageToDelete.id);
             setMessageToDelete(null);
+            // optionally notify server about deletion if you implement it
         }
     };
 
@@ -225,8 +311,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
         switch (msg.type) {
             case 'image': return <img src={msg.content as string} className="max-w-xs rounded-lg" alt="Sent image" />;
             case 'audio': return <AudioPlayer src={msg.content as string} />;
-            case 'location': const { lat, lon } = msg.content as Location;
+            case 'location': {
+                const { lat, lon } = msg.content as Location;
                 return <a href={`https://www.google.com/maps?q=${lat},${lon}`} target="_blank" rel="noopener noreferrer" className="text-white underline font-semibold flex items-center gap-2"><MapPinIcon className="w-5 h-5" /> {t('viewOnMap')}</a>;
+            }
             case 'gif': return <img src={msg.content as string} className="max-w-[150px] rounded-lg" alt="Sent GIF" />;
             case 'text':
             default: return msg.content;
@@ -249,7 +337,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
                 <img src={user.image} alt={user.name} className="w-10 h-10 rounded-full object-cover" />
                 <h2 className="font-bold text-lg ml-3">{user.name}</h2>
             </header>
-            
+
             <main className="flex-grow p-4 overflow-y-auto">
                 <div className="space-y-4">
                     {messages.map((msg) => (
@@ -276,38 +364,22 @@ const ChatPage: React.FC<ChatPageProps> = ({ user, onBack }) => {
                 {isAttachmentMenuOpen && (
                     <div className="grid grid-cols-4 gap-4 p-4 mb-2 bg-gray-200 dark:bg-gray-800 rounded-lg">
                         <AttachmentButton icon={<ImageIcon className="w-6 h-6" />} label={t('sendPhoto')} onClick={() => fileInputRef.current?.click()} />
-                        <AttachmentButton icon={<MicrophoneIcon className="w-6 h-6" />} label={t('sendVoice')} onClick={startRecording} />
                         <AttachmentButton icon={<MapPinIcon className="w-6 h-6" />} label={t('sendLocation')} onClick={handleSendLocation} />
                         <AttachmentButton icon={<b className="text-lg">GIF</b>} label={t('sendGif')} onClick={() => { setGifPickerOpen(true); setAttachmentMenuOpen(false); }} />
                     </div>
                 )}
-                {recordingStatus === 'recording' ? (
-                    <div className="flex items-center justify-between p-2 bg-red-500 rounded-full text-white">
-                        <span className="ml-4 animate-pulse">{t('recording')}</span>
-                        <button onClick={stopRecording} className="p-2 bg-white text-red-500 rounded-full"><StopIcon className="w-6 h-6"/></button>
-                    </div>
-                ) : recordedAudio ? (
-                     <div className="flex items-center justify-between p-2 bg-gray-200 dark:bg-gray-700 rounded-full">
-                        <AudioPlayer src={recordedAudio.url} />
-                        <div className="flex items-center gap-2">
-                            <button onClick={() => setRecordedAudio(null)} className="p-2 text-gray-600 dark:text-gray-300"><TrashIcon className="w-6 h-6"/></button>
-                            <button onClick={sendRecording} className="p-2 bg-blue-500 text-white rounded-full"><SendIcon className="w-6 h-6"/></button>
-                        </div>
-                    </div>
-                ) : (
-                    <div className="flex items-center gap-2">
-                        <button onClick={() => setAttachmentMenuOpen(!isAttachmentMenuOpen)} className="p-2 text-gray-500 dark:text-gray-400">
-                           <PaperclipIcon className="w-6 h-6" />
-                        </button>
-                        <input
-                            type="text" value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && handleSendText()}
-                            placeholder={t('typeMessage')} className="w-full px-4 py-2 bg-gray-200 dark:bg-gray-700 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        />
-                        <button onClick={handleSendText} className="p-2 bg-blue-500 text-white rounded-full hover:bg-blue-600 transition-colors">
-                           <SendIcon className="w-6 h-6" />
-                        </button>
-                    </div>
-                )}
+                <div className="flex items-center gap-2">
+                    <button onClick={() => setAttachmentMenuOpen(!isAttachmentMenuOpen)} className="p-2 text-gray-500 dark:text-gray-400">
+                       <PaperclipIcon className="w-6 h-6" />
+                    </button>
+                    <input
+                        type="text" value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && handleSendText()}
+                        placeholder={t('typeMessage')} className="w-full px-4 py-2 bg-gray-200 dark:bg-gray-700 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <button onClick={handleSendText} className="p-2 bg-blue-500 text-white rounded-full hover:bg-blue-600 transition-colors">
+                       <SendIcon className="w-6 h-6" />
+                    </button>
+                </div>
                 <input type="file" ref={fileInputRef} onChange={handleImageSelect} className="hidden" accept="image/*" />
             </footer>
         </div>
